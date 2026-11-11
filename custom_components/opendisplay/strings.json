@@ -117,6 +117,27 @@
             }
           }
         }
+      },
+      "wake": {
+        "name": "Wake",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "unknown": "Unknown",
+              "power_on": "Power on",
+              "reset": "Reset pin",
+              "rtc": "RTC timer",
+              "timer": "Sleep timer",
+              "button": "Button",
+              "software": "Software restart",
+              "panic": "Crash",
+              "watchdog": "Watchdog",
+              "brownout": "Brownout",
+              "usb": "USB power",
+              "other": "Other"
+            }
+          }
+        }
       }
     },
     "sensor": {
@@ -131,6 +152,23 @@
       },
       "last_seen": {
         "name": "Last seen"
+      },
+      "last_wake": {
+        "name": "Last wake",
+        "state": {
+          "unknown": "Unknown",
+          "power_on": "Power on",
+          "reset": "Reset pin",
+          "rtc": "RTC timer",
+          "timer": "Sleep timer",
+          "button": "Button",
+          "software": "Software restart",
+          "panic": "Crash",
+          "watchdog": "Watchdog",
+          "brownout": "Brownout",
+          "usb": "USB power",
+          "other": "Other"
+        }
       }
     },
     "update": {

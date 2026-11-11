@@ -28,6 +28,7 @@ from opendisplay.models.config import SensorData
 from opendisplay.models.enums import CapacityEstimator, PowerMode, SensorType
 
 from . import OpenDisplayConfigEntry
+from .const import WAKE_CAUSES
 from .coordinator import OpenDisplayUpdate
 from .entity import OpenDisplayEntity
 
@@ -102,6 +103,23 @@ def _sht40_descriptions(
     ]
 
 
+def _last_wake_description(byte_index: int) -> OpenDisplaySensorEntityDescription:
+    """Build the "Last wake" enum sensor for the wake-cause byte at byte_index."""
+
+    def _cause(upd: OpenDisplayUpdate) -> str | None:
+        cause = upd.advertisement.wake_cause(byte_index)
+        return None if cause is None else cause.name.lower()
+
+    return OpenDisplaySensorEntityDescription(
+        key="last_wake",
+        translation_key="last_wake",
+        device_class=SensorDeviceClass.ENUM,
+        options=WAKE_CAUSES,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_cause,
+    )
+
+
 _BATTERY_POWER_MODES = {PowerMode.BATTERY, PowerMode.SOLAR}
 
 _BATTERY_VOLTAGE_DESCRIPTION = OpenDisplaySensorEntityDescription(
@@ -156,6 +174,9 @@ async def async_setup_entry(
     for sensor in device_config.sensors:
         if sensor.sensor_type_enum is SensorType.SHT40:
             descriptions += _sht40_descriptions(sensor)
+
+    if (wake_index := power_config.published_wake_info_byte_index) is not None:
+        descriptions.append(_last_wake_description(wake_index))
 
     if power_config.power_mode_enum in _BATTERY_POWER_MODES:
         capacity_estimator = power_config.capacity_estimator or CapacityEstimator.LI_ION

@@ -95,3 +95,21 @@ CONF_CACHED_STATE = "cached_state"
 # --- Bus events -------------------------------------------------------------
 EVENT_CONTENT_DELIVERED = f"{DOMAIN}_content_delivered"
 EVENT_CONTENT_EXPIRED = f"{DOMAIN}_content_expired"
+
+
+# Lower-case WakeCause names, the states of the "Last wake" sensor and the
+# event types of the "Wake" event entity. Order follows the enum values.
+WAKE_CAUSES: list[str] = [
+    "unknown",
+    "power_on",
+    "reset",
+    "rtc",
+    "timer",
+    "button",
+    "software",
+    "panic",
+    "watchdog",
+    "brownout",
+    "usb",
+    "other",
+]

@@ -20,6 +20,8 @@ from opendisplay.models.advertisement import (
     ButtonChangeEvent,
     TouchChangeEvent,
     TouchTracker,
+    WakeChangeEvent,
+    WakeTracker,
 )
 from opendisplay.models.config import BinaryInputs
 
@@ -36,6 +38,8 @@ class OpenDisplayUpdate:
     last_seen: float | None = None
     button_events: list[ButtonChangeEvent] = field(default_factory=list)
     touch_events: list[TouchChangeEvent] = field(default_factory=list)
+    # Set on the advertisement that revealed a new wake (see WakeTracker).
+    wake_event: WakeChangeEvent | None = None
 
 
 class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
@@ -46,6 +50,7 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         hass: HomeAssistant,
         address: str,
         binary_inputs: list[BinaryInputs] | None = None,
+        wake_info_byte_index: int | None = None,
     ) -> None:
         """Initialize the coordinator.
 
@@ -54,6 +59,10 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         belong to touch controllers and sensors and decode into valid-looking
         button reports, so without it a moving touch coordinate or a refreshed
         SHT40 reading produces phantom button transitions.
+
+        wake_info_byte_index is PowerOption.published_wake_info_byte_index:
+        the dynamic byte carrying the wake cause, or None when the device
+        does not publish one.
         """
         super().__init__(
             hass,
@@ -73,6 +82,10 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
             ]
         )
         self.touch_trackers: list[TouchTracker] = []
+        self.wake_info_byte_index = wake_info_byte_index
+        self._wake_tracker: WakeTracker | None = (
+            None if wake_info_byte_index is None else WakeTracker(wake_info_byte_index)
+        )
         # Subscribers notified once when the advertised reboot flag goes
         # False -> True (the device rebooted since we last talked to it).
         self._reboot_callbacks: set[CALLBACK_TYPE] = set()
@@ -132,6 +145,7 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         if not self._available:
             _LOGGER.info("%s: Device is available again", service_info.address)
 
+        rebooted = False
         if MANUFACTURER_ID not in service_info.manufacturer_data:
             super()._async_handle_bluetooth_event(service_info, change)
             return
@@ -148,29 +162,50 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
                 exc_info=True,
             )
         else:
-            self._check_reboot_flag(advertisement)
+            rebooted = self._check_reboot_flag(advertisement)
             button_events = self._tracker.update(service_info.address, advertisement)
             touch_events: list[TouchChangeEvent] = []
             for touch_tracker in self.touch_trackers:
                 touch_events.extend(
                     touch_tracker.update(service_info.address, advertisement)
                 )
+            now = time.time()
+            wake_event = (
+                None
+                if self._wake_tracker is None
+                else self._wake_tracker.update(
+                    service_info.address, advertisement, timestamp=now
+                )
+            )
+            if wake_event is not None:
+                _LOGGER.debug(
+                    "%s: New wake (%s, detected by %s)",
+                    service_info.address,
+                    wake_event.cause.name.lower(),
+                    wake_event.reason,
+                )
             self.data = OpenDisplayUpdate(
                 address=service_info.address,
                 advertisement=advertisement,
                 rssi=service_info.rssi,
-                last_seen=time.time(),
+                last_seen=now,
                 button_events=button_events,
                 touch_events=touch_events,
+                wake_event=wake_event,
             )
             for device_seen_callback in list(self._device_seen_callbacks):
                 device_seen_callback()
 
         super()._async_handle_bluetooth_event(service_info, change)
+        # After the listeners: a reboot callback may reload the entry (and so
+        # unload every entity) eagerly, which would drop the events this very
+        # advertisement carries -- notably the wake event of the reboot.
+        if rebooted:
+            self._notify_reboot()
 
     @callback
-    def _check_reboot_flag(self, advertisement: AdvertisementData) -> None:
-        """Notify on a reboot, detected as a reboot-flag False -> True edge.
+    def _check_reboot_flag(self, advertisement: AdvertisementData) -> bool:
+        """Detect a reboot, i.e. a reboot-flag False -> True edge.
 
         The device sets the advertised reboot flag on boot and clears it on the
         first BLE connection. We react only to a False -> True transition: the
@@ -181,12 +216,17 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         reboot_flag = advertisement.reboot_flag
         if reboot_flag is None:
             # Legacy advertisement: no reboot flag, leave previous state intact.
-            return
+            return False
 
         previous = self._last_reboot_flag
         self._last_reboot_flag = reboot_flag
+        return bool(reboot_flag and previous is False)
 
-        if reboot_flag and previous is False and self._reboot_callbacks:
-            _LOGGER.info("%s: Device rebooted since last connection", self.address)
-            for reboot_callback in list(self._reboot_callbacks):
-                reboot_callback()
+    @callback
+    def _notify_reboot(self) -> None:
+        """Run the reboot subscribers (see _check_reboot_flag)."""
+        if not self._reboot_callbacks:
+            return
+        _LOGGER.info("%s: Device rebooted since last connection", self.address)
+        for reboot_callback in list(self._reboot_callbacks):
+            reboot_callback()

@@ -14,6 +14,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from opendisplay.models.advertisement import TouchTracker
 
 from . import OpenDisplayConfigEntry
+from .const import WAKE_CAUSES
 from .entity import OpenDisplayEntity
 
 PARALLEL_UPDATES = 0
@@ -103,6 +104,24 @@ async def async_setup_entry(
         {f"{coordinator.address}-{d.key}" for d in touch_descriptions},
     )
 
+    # --- Wake entity (only when the device publishes its wake cause) ---
+    if coordinator.wake_info_byte_index is not None:
+        async_add_entities(
+            [
+                OpenDisplayWakeEventEntity(
+                    coordinator,
+                    EventEntityDescription(
+                        key="wake",
+                        translation_key="wake",
+                        event_types=WAKE_CAUSES,
+                        icon="mdi:power-sleep",
+                    ),
+                )
+            ]
+        )
+    else:
+        _remove_stale(f"{coordinator.address}-wake", set())
+
     async_add_entities(
         OpenDisplayEventEntity(coordinator, description)
         for description in button_descriptions
@@ -154,5 +173,32 @@ class OpenDisplayTouchEventEntity(
                         event.event_type,
                         {"x": event.x, "y": event.y},
                     )
+            self._last_processed_data = data
+            self.async_write_ha_state()
+
+
+class OpenDisplayWakeEventEntity(
+    OpenDisplayEntity[EventEntityDescription], EventEntity
+):
+    """Fires once per observed device wake, with the wake cause as event type."""
+
+    _last_processed_data: object | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Fire when this coordinator update revealed a new wake."""
+        data = self.coordinator.data
+        if data is not None and data is not self._last_processed_data:
+            wake = data.wake_event
+            if wake is not None:
+                self._trigger_event(
+                    wake.cause.name.lower(),
+                    {
+                        "previous_cause": None
+                        if wake.previous_cause is None
+                        else wake.previous_cause.name.lower(),
+                        "detected_by": wake.reason,
+                    },
+                )
             self._last_processed_data = data
             self.async_write_ha_state()
