@@ -97,8 +97,9 @@ EVENT_CONTENT_DELIVERED = f"{DOMAIN}_content_delivered"
 EVENT_CONTENT_EXPIRED = f"{DOMAIN}_content_expired"
 
 
-# Lower-case WakeCause names, the states of the "Last wake" sensor and the
-# event types of the "Wake" event entity. Order follows the enum values.
+# States of the "Last wake" sensor and event types of the "Wake" event entity:
+# the lower-case WakeCause names (level 2, firmware publishes wake info), then
+# the two causes inferred from the reboot flag (level 1, any firmware).
 WAKE_CAUSES: list[str] = [
     "unknown",
     "power_on",
@@ -112,4 +113,6 @@ WAKE_CAUSES: list[str] = [
     "brownout",
     "usb",
     "other",
+    "scheduled",
+    "restart",
 ]

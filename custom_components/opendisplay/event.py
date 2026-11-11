@@ -1,6 +1,7 @@
 """Event platform for OpenDisplay devices — button press/release and touch events."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from homeassistant.components.event import (
     EventDeviceClass,
@@ -104,8 +105,8 @@ async def async_setup_entry(
         {f"{coordinator.address}-{d.key}" for d in touch_descriptions},
     )
 
-    # --- Wake entity (only when the device publishes its wake cause) ---
-    if coordinator.wake_info_byte_index is not None:
+    # --- Wake / sleep entities (when the coordinator tracks wakes) ---
+    if coordinator.wake_tracking is not None:
         async_add_entities(
             [
                 OpenDisplayWakeEventEntity(
@@ -114,13 +115,23 @@ async def async_setup_entry(
                         key="wake",
                         translation_key="wake",
                         event_types=WAKE_CAUSES,
+                        icon="mdi:power-on",
+                    ),
+                ),
+                OpenDisplaySleepEventEntity(
+                    coordinator,
+                    EventEntityDescription(
+                        key="sleep",
+                        translation_key="sleep",
+                        event_types=["asleep"],
                         icon="mdi:power-sleep",
                     ),
-                )
+                ),
             ]
         )
     else:
         _remove_stale(f"{coordinator.address}-wake", set())
+        _remove_stale(f"{coordinator.address}-sleep", set())
 
     async_add_entities(
         OpenDisplayEventEntity(coordinator, description)
@@ -191,14 +202,56 @@ class OpenDisplayWakeEventEntity(
         if data is not None and data is not self._last_processed_data:
             wake = data.wake_event
             if wake is not None:
+                info = wake.info
                 self._trigger_event(
-                    wake.cause.name.lower(),
+                    wake.cause,
                     {
-                        "previous_cause": None
-                        if wake.previous_cause is None
-                        else wake.previous_cause.name.lower(),
+                        "previous_cause": wake.previous_cause,
                         "detected_by": wake.reason,
+                        "seconds_until_sleep": None
+                        if info is None
+                        else info.seconds_until_sleep,
+                        "sleep_seconds": None if info is None else info.sleep_seconds,
                     },
                 )
             self._last_processed_data = data
             self.async_write_ha_state()
+
+
+class OpenDisplaySleepEventEntity(
+    OpenDisplayEntity[EventEntityDescription], EventEntity
+):
+    """Fires "asleep" once the device's announced sleep time has passed.
+
+    Level 2 uses the advertised seconds-until-sleep; level 1 fires after a
+    stretch of silence. Never relies on a last-moment advertisement, which
+    passive scanners routinely miss.
+    """
+
+    _last_processed_data: object | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Fire when the coordinator pushed its asleep update."""
+        data = self.coordinator.data
+        if data is not None and data is not self._last_processed_data:
+            asleep = data.asleep_event
+            if asleep is not None:
+                self._trigger_event(
+                    "asleep",
+                    {
+                        "next_wake": None
+                        if asleep.next_wake is None
+                        else datetime.fromtimestamp(
+                            asleep.next_wake, tz=UTC
+                        ).isoformat(),
+                        "sleep_seconds": asleep.sleep_seconds,
+                    },
+                )
+            self._last_processed_data = data
+            self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Stay available while the device sleeps, which is its whole point."""
+        return True

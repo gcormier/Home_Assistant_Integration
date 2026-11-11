@@ -1,6 +1,7 @@
 """Passive BLE coordinator for OpenDisplay devices."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 import logging
 import time
 
@@ -13,6 +14,7 @@ from homeassistant.components.bluetooth.passive_update_coordinator import (
     PassiveBluetoothDataUpdateCoordinator,
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 
 from opendisplay import MANUFACTURER_ID, AdvertisementTracker, parse_advertisement
 from opendisplay.models.advertisement import (
@@ -25,7 +27,41 @@ from opendisplay.models.advertisement import (
 )
 from opendisplay.models.config import BinaryInputs
 
+from .ble_lock import async_get_ble_lock
+
 _LOGGER: logging.Logger = logging.getLogger(__package__)
+
+# Level 2: the device announces when it will sleep; allow for clock skew and
+# the time it takes to stop advertising before declaring it asleep.
+ASLEEP_GRACE_SECONDS = 3.0
+# Level 1 (no announcement): this much silence after the last advertisement
+# means the device went back to sleep.
+ASLEEP_SILENCE_SECONDS = 30.0
+# While this integration holds the BLE link the device does not advertise;
+# re-check this often instead of declaring it asleep.
+ASLEEP_RECHECK_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class WakeTracking:
+    """How wake/sleep is tracked for one device.
+
+    byte_index is PowerOption.published_wake_info_byte_index (level 2: the
+    device publishes cause and sleep timing), or None to fall back to the
+    reboot flag (level 1). sleep_seconds is the configured
+    deep_sleep_time_seconds, used for the level-1 next-wake estimate.
+    """
+
+    byte_index: int | None
+    sleep_seconds: int | None
+
+
+@dataclass(frozen=True)
+class AsleepEvent:
+    """The device went to sleep (announced time passed, or level-1 silence)."""
+
+    next_wake: float | None
+    sleep_seconds: int | None
 
 
 @dataclass
@@ -40,6 +76,11 @@ class OpenDisplayUpdate:
     touch_events: list[TouchChangeEvent] = field(default_factory=list)
     # Set on the advertisement that revealed a new wake (see WakeTracker).
     wake_event: WakeChangeEvent | None = None
+    # Cause of the current/last wake, and the predicted next wake (epoch s).
+    wake_cause: str | None = None
+    next_wake: float | None = None
+    # Set only on the synthetic update pushed when the device fell asleep.
+    asleep_event: AsleepEvent | None = None
 
 
 class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
@@ -50,7 +91,7 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         hass: HomeAssistant,
         address: str,
         binary_inputs: list[BinaryInputs] | None = None,
-        wake_info_byte_index: int | None = None,
+        wake_tracking: WakeTracking | None = None,
     ) -> None:
         """Initialize the coordinator.
 
@@ -60,9 +101,8 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         button reports, so without it a moving touch coordinate or a refreshed
         SHT40 reading produces phantom button transitions.
 
-        wake_info_byte_index is PowerOption.published_wake_info_byte_index:
-        the dynamic byte carrying the wake cause, or None when the device
-        does not publish one.
+        wake_tracking enables the wake/sleep entities (see WakeTracking);
+        None for devices that neither publish wake info nor deep sleep.
         """
         super().__init__(
             hass,
@@ -82,10 +122,12 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
             ]
         )
         self.touch_trackers: list[TouchTracker] = []
-        self.wake_info_byte_index = wake_info_byte_index
+        self.wake_tracking = wake_tracking
         self._wake_tracker: WakeTracker | None = (
-            None if wake_info_byte_index is None else WakeTracker(wake_info_byte_index)
+            None if wake_tracking is None else WakeTracker(wake_tracking.byte_index)
         )
+        self._cancel_asleep: CALLBACK_TYPE | None = None
+        self._pending_asleep: AsleepEvent | None = None
         # Subscribers notified once when the advertised reboot flag goes
         # False -> True (the device rebooted since we last talked to it).
         self._reboot_callbacks: set[CALLBACK_TYPE] = set()
@@ -181,9 +223,10 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
                 _LOGGER.debug(
                     "%s: New wake (%s, detected by %s)",
                     service_info.address,
-                    wake_event.cause.name.lower(),
+                    wake_event.cause,
                     wake_event.reason,
                 )
+            next_wake = self._schedule_asleep(advertisement, now)
             self.data = OpenDisplayUpdate(
                 address=service_info.address,
                 advertisement=advertisement,
@@ -192,6 +235,10 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
                 button_events=button_events,
                 touch_events=touch_events,
                 wake_event=wake_event,
+                wake_cause=None
+                if self._wake_tracker is None
+                else self._wake_tracker.current(service_info.address),
+                next_wake=next_wake,
             )
             for device_seen_callback in list(self._device_seen_callbacks):
                 device_seen_callback()
@@ -202,6 +249,78 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         # advertisement carries -- notably the wake event of the reboot.
         if rebooted:
             self._notify_reboot()
+
+    @callback
+    def _schedule_asleep(
+        self, advertisement: AdvertisementData, now: float
+    ) -> float | None:
+        """(Re)arm the asleep timer from this advertisement; return next wake.
+
+        Level 2 uses the announced seconds-until-sleep and sleep duration.
+        Level 1 assumes the device sleeps right after its last advertisement
+        and declares it asleep after ASLEEP_SILENCE_SECONDS of silence.
+        """
+        if self._cancel_asleep is not None:
+            self._cancel_asleep()
+            self._cancel_asleep = None
+        self._pending_asleep = None
+        tracking = self.wake_tracking
+        if tracking is None:
+            return None
+        if tracking.byte_index is not None:
+            info = advertisement.wake_info(tracking.byte_index)
+            if info is None or info.seconds_until_sleep is None:
+                return None
+            sleep_at = now + info.seconds_until_sleep
+            sleep_seconds = info.sleep_seconds
+            delay = info.seconds_until_sleep + ASLEEP_GRACE_SECONDS
+        else:
+            if tracking.sleep_seconds is None:
+                return None
+            sleep_at = now
+            sleep_seconds = tracking.sleep_seconds
+            delay = ASLEEP_SILENCE_SECONDS
+        next_wake = None if sleep_seconds is None else sleep_at + sleep_seconds
+        self._pending_asleep = AsleepEvent(
+            next_wake=next_wake, sleep_seconds=sleep_seconds
+        )
+        self._cancel_asleep = async_call_later(self.hass, delay, self._async_asleep)
+        return next_wake
+
+    @callback
+    def _async_asleep(self, _now: datetime) -> None:
+        """Declare the device asleep: its announced sleep time passed in silence."""
+        self._cancel_asleep = None
+        event = self._pending_asleep
+        if event is None or self.data is None:
+            return
+        if async_get_ble_lock(self.address).locked():
+            # Our own connection keeps it awake and silent; not asleep yet.
+            if self._wake_tracker is not None:
+                self._wake_tracker.touch(self.address)
+            self._cancel_asleep = async_call_later(
+                self.hass, ASLEEP_RECHECK_SECONDS, self._async_asleep
+            )
+            return
+        self._pending_asleep = None
+        _LOGGER.debug(
+            "%s: Device is asleep (next wake %s)", self.address, event.next_wake
+        )
+        self.data = replace(
+            self.data,
+            button_events=[],
+            touch_events=[],
+            wake_event=None,
+            asleep_event=event,
+        )
+        self.async_update_listeners()
+
+    @callback
+    def async_shutdown_wake_timer(self) -> None:
+        """Cancel the pending asleep timer (entry unload)."""
+        if self._cancel_asleep is not None:
+            self._cancel_asleep()
+            self._cancel_asleep = None
 
     @callback
     def _check_reboot_flag(self, advertisement: AdvertisementData) -> bool:

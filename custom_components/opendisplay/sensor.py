@@ -103,21 +103,26 @@ def _sht40_descriptions(
     ]
 
 
-def _last_wake_description(byte_index: int) -> OpenDisplaySensorEntityDescription:
-    """Build the "Last wake" enum sensor for the wake-cause byte at byte_index."""
+# Wake/sleep sensors exist when the coordinator tracks wakes (the firmware
+# publishes wake info, or the device deep-sleeps and the reboot flag is used).
+_LAST_WAKE_DESCRIPTION = OpenDisplaySensorEntityDescription(
+    key="last_wake",
+    translation_key="last_wake",
+    device_class=SensorDeviceClass.ENUM,
+    options=WAKE_CAUSES,
+    entity_category=EntityCategory.DIAGNOSTIC,
+    value_fn=lambda upd: upd.wake_cause,
+)
 
-    def _cause(upd: OpenDisplayUpdate) -> str | None:
-        cause = upd.advertisement.wake_cause(byte_index)
-        return None if cause is None else cause.name.lower()
-
-    return OpenDisplaySensorEntityDescription(
-        key="last_wake",
-        translation_key="last_wake",
-        device_class=SensorDeviceClass.ENUM,
-        options=WAKE_CAUSES,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_cause,
-    )
+_NEXT_WAKE_DESCRIPTION = OpenDisplaySensorEntityDescription(
+    key="next_wake",
+    translation_key="next_wake",
+    device_class=SensorDeviceClass.TIMESTAMP,
+    entity_category=EntityCategory.DIAGNOSTIC,
+    value_fn=lambda upd: (
+        None if upd.next_wake is None else datetime.fromtimestamp(upd.next_wake, tz=UTC)
+    ),
+)
 
 
 _BATTERY_POWER_MODES = {PowerMode.BATTERY, PowerMode.SOLAR}
@@ -175,8 +180,8 @@ async def async_setup_entry(
         if sensor.sensor_type_enum is SensorType.SHT40:
             descriptions += _sht40_descriptions(sensor)
 
-    if (wake_index := power_config.published_wake_info_byte_index) is not None:
-        descriptions.append(_last_wake_description(wake_index))
+    if coordinator.wake_tracking is not None:
+        descriptions += [_LAST_WAKE_DESCRIPTION, _NEXT_WAKE_DESCRIPTION]
 
     if power_config.power_mode_enum in _BATTERY_POWER_MODES:
         capacity_estimator = power_config.capacity_estimator or CapacityEstimator.LI_ION

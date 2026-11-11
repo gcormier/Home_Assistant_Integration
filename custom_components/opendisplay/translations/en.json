@@ -134,7 +134,19 @@
                             "watchdog": "Watchdog",
                             "brownout": "Brownout",
                             "usb": "USB power",
-                            "other": "Other"
+                            "other": "Other",
+                            "scheduled": "Scheduled",
+                            "restart": "Restart"
+                        }
+                    }
+                }
+            },
+            "sleep": {
+                "name": "Sleep",
+                "state_attributes": {
+                    "event_type": {
+                        "state": {
+                            "asleep": "Asleep"
                         }
                     }
                 }
@@ -167,8 +179,13 @@
                     "watchdog": "Watchdog",
                     "brownout": "Brownout",
                     "usb": "USB power",
-                    "other": "Other"
+                    "other": "Other",
+                    "scheduled": "Scheduled",
+                    "restart": "Restart"
                 }
+            },
+            "next_wake": {
+                "name": "Next wake"
             }
         },
         "update": {

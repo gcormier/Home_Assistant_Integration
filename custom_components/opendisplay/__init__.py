@@ -35,7 +35,7 @@ from opendisplay.models.config_json import config_from_json, config_to_json
 
 from .ble_lock import async_get_ble_lock, ble_connection
 from .const import CONF_CACHED_STATE, CONF_ENCRYPTION_KEY, DOMAIN, SETUP_DEADLINE_S
-from .coordinator import OpenDisplayCoordinator
+from .coordinator import OpenDisplayCoordinator, WakeTracking
 from .delivery import DeliveryManager
 from .services import async_setup_services
 from .sleep import SleepProfile
@@ -300,12 +300,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
     from .update import _format_firmware_version
 
     profile = SleepProfile.from_entry(entry, device_config)
+    power = device_config.power
+    wake_index = power.published_wake_info_byte_index
     coordinator = OpenDisplayCoordinator(
         hass,
         address,
         device_config.binary_inputs,
-        device_config.power.published_wake_info_byte_index,
+        # Level 2 when the firmware publishes wake info; otherwise level 1
+        # (reboot flag) for deep-sleeping devices only.
+        WakeTracking(
+            byte_index=wake_index,
+            sleep_seconds=power.deep_sleep_time_seconds
+            if power.deep_sleep_enabled
+            else None,
+        )
+        if wake_index is not None or power.deep_sleep_enabled
+        else None,
     )
+    entry.async_on_unload(coordinator.async_shutdown_wake_timer)
 
     manufacturer = device_config.manufacturer
     display = device_config.displays[0]
