@@ -455,3 +455,26 @@ drawcustom:
       default: false
       selector:
         boolean:
+
+deep_sleep:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: opendisplay
+    duration:
+      required: false
+      example: "08:00:00"
+      selector:
+        duration:
+    until:
+      required: false
+      example: "06:00:00"
+      selector:
+        time:
+    queue:
+      required: false
+      default: true
+      selector:
+        boolean:

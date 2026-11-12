@@ -40,6 +40,10 @@ ASLEEP_SILENCE_SECONDS = 30.0
 # While this integration holds the BLE link the device does not advertise;
 # re-check this often instead of declaring it asleep.
 ASLEEP_RECHECK_SECONDS = 5.0
+# After a deep-sleep override was sent, advertisements this soon after are
+# stragglers from the wake that just ended (scanner/proxy latency), not a new
+# wake: they must not replace the override's next-wake estimate.
+SLEEP_OVERRIDE_STRAGGLER_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,42 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         # Reboot-flag edge detection: the device sets the advertised reboot flag
         # on boot and clears it on first connect. None until the first v1 advert.
         self._last_reboot_flag: bool | None = None
+        # (sent_at, next_wake) of a one-shot deep-sleep override, until the
+        # device is seen awake again after it.
+        self._sleep_override: tuple[float, float] | None = None
+
+    @property
+    def sleep_override_active(self) -> bool:
+        """Return True while a sent deep-sleep override has not ended yet."""
+        return self._sleep_override is not None
+
+    @callback
+    def async_note_sleep_override(self, seconds: int) -> float:
+        """Record that the device was just told to sleep for ``seconds``.
+
+        The link dropping is the confirmation that the device is asleep, so the
+        Sleep event fires now, and the next-wake estimate becomes
+        ``sleep_at + seconds`` for this one sleep (the configured cadence
+        applies again from the wake after it). Returns that estimate.
+        """
+        now = time.time()
+        next_wake = now + seconds
+        self._sleep_override = (now, next_wake)
+        if self._cancel_asleep is not None:
+            self._cancel_asleep()
+            self._cancel_asleep = None
+        self._pending_asleep = None
+        if self.data is not None:
+            self.data = replace(
+                self.data,
+                button_events=[],
+                touch_events=[],
+                wake_event=None,
+                next_wake=next_wake,
+                asleep_event=AsleepEvent(next_wake=next_wake, sleep_seconds=seconds),
+            )
+            self.async_update_listeners()
+        return next_wake
 
     @callback
     def async_subscribe_reboot(self, callback_: CALLBACK_TYPE) -> CALLBACK_TYPE:
@@ -226,7 +266,9 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
                     wake_event.cause,
                     wake_event.reason,
                 )
-            next_wake = self._schedule_asleep(advertisement, now)
+            next_wake = self._next_wake_after_override(now)
+            if next_wake is None:
+                next_wake = self._schedule_asleep(advertisement, now)
             self.data = OpenDisplayUpdate(
                 address=service_info.address,
                 advertisement=advertisement,
@@ -249,6 +291,22 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         # advertisement carries -- notably the wake event of the reboot.
         if rebooted:
             self._notify_reboot()
+
+    @callback
+    def _next_wake_after_override(self, now: float) -> float | None:
+        """Return the override's next wake for a straggler advertisement.
+
+        An advertisement within SLEEP_OVERRIDE_STRAGGLER_SECONDS of the
+        override keeps its estimate and arms no asleep timer. Any later one
+        means the device is awake again, which ends the override.
+        """
+        if self._sleep_override is None:
+            return None
+        sent_at, next_wake = self._sleep_override
+        if now - sent_at < SLEEP_OVERRIDE_STRAGGLER_SECONDS:
+            return next_wake
+        self._sleep_override = None
+        return None
 
     @callback
     def _schedule_asleep(

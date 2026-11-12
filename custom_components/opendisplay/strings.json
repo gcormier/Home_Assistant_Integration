@@ -201,6 +201,18 @@
     "config_entry_not_found": {
       "message": "Config entry not found: `{address}`"
     },
+    "deep_sleep_disabled": {
+      "message": "Device `{device_id}` refused deep sleep: deep sleep is disabled in its configuration. It is still awake."
+    },
+    "deep_sleep_mains_powered": {
+      "message": "Device `{device_id}` refused deep sleep: it is mains powered. It is still awake."
+    },
+    "deep_sleep_rejected": {
+      "message": "Device `{device_id}` rejected the deep sleep command: {error}"
+    },
+    "deep_sleep_unsupported": {
+      "message": "Device `{device_id}` does not support deep sleep."
+    },
     "device_not_found": {
       "message": "Could not find Bluetooth device with address `{address}`. Reason: {reason}"
     },
@@ -544,6 +556,28 @@
         }
       },
       "name": "Draw custom image"
+    },
+    "deep_sleep": {
+      "name": "Deep sleep",
+      "description": "Puts a battery OpenDisplay device into deep sleep now, for one sleep of a given length or until a time of day. The device then returns to its configured wake interval. A sleeping device receives the command at its next wake, after any queued content.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The OpenDisplay device."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "How long to sleep. Limited to 60 seconds to about 18.2 hours. Use either this or Until."
+        },
+        "until": {
+          "name": "Until",
+          "description": "Time of day to wake up, in Home Assistant's time zone. Times more than about 18.2 hours away sleep the maximum instead. Use either this or Duration."
+        },
+        "queue": {
+          "name": "Queue if asleep",
+          "description": "If the device is asleep, send the command at its next wake. When off, the action fails if the device cannot be reached now."
+        }
+      }
     }
   }
 }

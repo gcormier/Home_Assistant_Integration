@@ -45,6 +45,7 @@ and these actions:
 | `opendisplay.activate_buzzer` | play a tone |
 | `opendisplay.play_melody` | play a sequence of notes |
 | `opendisplay.write_nfc` | write a URL, text, MIME record or Home Assistant tag to the NFC chip |
+| `opendisplay.deep_sleep` | put a battery tag to sleep now, for one sleep of a given length or until a time of day |
 
 **Battery-powered tags are handled properly.** A deep-sleeping tag is dark most
 of the time, so content sent to one is queued and delivered the next time it
@@ -196,6 +197,40 @@ data:
   device_id: YOUR_DEVICE_ID
   record_type: url
   content: https://www.home-assistant.io/
+```
+
+### Sleep overnight
+
+A battery tag wakes on one fixed interval (`deep_sleep_time_seconds` in its
+config). `deep_sleep` overrides that for a single sleep: the tag sleeps now, wakes
+after `duration` or at `until` (a time of day in Home Assistant's time zone), and
+then goes back to its normal interval. One sleep lasts at most 65,535 s (about
+18.2 h); an `until` further away than that sleeps the maximum and logs a warning.
+
+A tag that is asleep when the action runs gets the command at its next wake,
+after any content waiting for it. A newer call replaces a queued one, and a
+queued command expires after the queue timeout. Set `queue: false` to fail
+instead when the tag cannot be reached right away. The tag's entities stay
+available through the longer sleep, and its *Next wake* sensor shows when it
+will be back.
+
+This automation puts two displays to sleep at 22:00 and wakes them at 06:00:
+
+```yaml
+automation:
+  - alias: Displays quiet overnight
+    triggers:
+      - trigger: time
+        at: "22:00:00"
+    actions:
+      - action: opendisplay.deep_sleep
+        data:
+          device_id: KITCHEN_DISPLAY_ID
+          until: "06:00:00"
+      - action: opendisplay.deep_sleep
+        data:
+          device_id: HALLWAY_DISPLAY_ID
+          until: "06:00:00"
 ```
 
 ## Translations

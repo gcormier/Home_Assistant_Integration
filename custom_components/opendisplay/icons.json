@@ -35,6 +35,9 @@
     },
     "write_nfc": {
       "service": "mdi:nfc-variant"
+    },
+    "deep_sleep": {
+      "service": "mdi:power-sleep"
     }
   }
 }

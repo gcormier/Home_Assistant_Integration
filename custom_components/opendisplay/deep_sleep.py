@@ -31,7 +31,9 @@ from homeassistant.core import CALLBACK_TYPE
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
-from opendisplay import (
+from opendisplay.exceptions import (
+    AuthenticationError,
+    IntegrityCheckError,
     OpenDisplayConnectionError,
     OpenDisplayTimeoutError,
     ProtocolError,
@@ -159,16 +161,19 @@ async def async_send_deep_sleep(
             frames.append(bytes(data))
             return data
 
-        device._read = _capturing_read  # type: ignore[method-assign]  # noqa: SLF001
+        device._read = _capturing_read  # type: ignore[method-assign]
     try:
         await device.deep_sleep(seconds)
+    except AuthenticationError, IntegrityCheckError:
+        # Not a NACK: the command was not executed. The caller decides.
+        raise
     except ProtocolError as err:
         raise _rejection(frames[-1] if frames else None, err, device_id) from err
     except (OpenDisplayConnectionError, OpenDisplayTimeoutError) as err:
         _LOGGER.debug("Link dropped after deep sleep command (expected): %s", err)
     finally:
         if original_read is not None:
-            device._read = original_read  # type: ignore[method-assign]  # noqa: SLF001
+            device._read = original_read  # type: ignore[method-assign]
 
 
 def _rejection(

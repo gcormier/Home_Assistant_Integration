@@ -10,6 +10,7 @@ import importlib
 import io
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -75,6 +76,7 @@ from .const import (
     DOMAIN,
     SIGNAL_IMAGE_UPDATED,
 )
+from .deep_sleep import PendingSleep, async_send_deep_sleep
 from .delivery import DELIVERY_DEADLINE_S, DeliveryReceipt
 from .transport import async_run_with_fallback
 
@@ -89,6 +91,9 @@ ATTR_USE_MEASURED_PALETTES = "measured_palette"
 ATTR_RECORD_TYPE = "record_type"
 ATTR_CONTENT = "content"
 ATTR_MIME_TYPE = "mime_type"
+ATTR_DURATION = "duration"
+ATTR_UNTIL = "until"
+ATTR_QUEUE = "queue"
 
 # Maximum NDEF record body the firmware accepts (matches the library's
 # client-side ValueError threshold); enforced here too so an oversized
@@ -314,6 +319,28 @@ SCHEMA_PLAY_MELODY = vol.Schema(
             vol.Coerce(int), vol.In([1, 2, 4, 8, 16, 32])
         ),
     }
+)
+
+
+def _positive_duration(value: timedelta) -> timedelta:
+    """Reject a zero or negative sleep duration (0 means "no override")."""
+    if value.total_seconds() <= 0:
+        raise vol.Invalid("duration must be greater than zero")
+    return value
+
+
+SCHEMA_DEEP_SLEEP = vol.All(
+    vol.Schema(
+        {
+            vol.Required(ATTR_DEVICE_ID): cv.string,
+            vol.Exclusive(ATTR_DURATION, "wake"): vol.All(
+                cv.time_period, _positive_duration
+            ),
+            vol.Exclusive(ATTR_UNTIL, "wake"): cv.time,
+            vol.Optional(ATTR_QUEUE, default=True): cv.boolean,
+        }
+    ),
+    cv.has_at_least_one_key(ATTR_DURATION, ATTR_UNTIL),
 )
 
 
@@ -1253,6 +1280,120 @@ async def _async_play_melody(call: ServiceCall) -> None:
     await _async_connect_and_run(call.hass, entry, _buzz)
 
 
+def _sleep_response(
+    status: str,
+    *,
+    expires_at: float | None = None,
+    sleep_seconds: int | None = None,
+    next_wake: float | None = None,
+) -> ServiceResponse:
+    """Build the deep_sleep service response."""
+
+    def _iso(ts: float | None) -> str | None:
+        return None if ts is None else datetime.fromtimestamp(ts, tz=UTC).isoformat()
+
+    return {
+        "status": status,
+        "expires_at": _iso(expires_at),
+        "sleep_seconds": sleep_seconds,
+        "next_wake": _iso(next_wake),
+    }
+
+
+async def _async_deep_sleep(call: ServiceCall) -> ServiceResponse:
+    """Handle the deep_sleep service call.
+
+    Sends the firmware's one-shot override (CMD_DEEP_SLEEP, 0x0053) so the
+    device sleeps now and wakes after a duration, or at a time of day, then
+    returns to its configured cadence. A sleeping device is reached at its next
+    wake: the command is queued like content (with the same probe first), and
+    queued content is delivered before it in that wake.
+    """
+    hass = call.hass
+    entry = _get_entry_for_device(call)
+    device_id: str = call.data[ATTR_DEVICE_ID]
+    queue: bool = call.data[ATTR_QUEUE]
+    runtime = entry.runtime_data
+    address = entry.unique_id or ""
+    profile = runtime.sleep_profile
+    manager = runtime.delivery
+    can_queue = queue and manager is not None and profile.is_sleepy
+
+    request = PendingSleep(
+        duration=call.data.get(ATTR_DURATION),
+        until=call.data.get(ATTR_UNTIL),
+        device_id=device_id,
+        queued_at=time.time(),
+    )
+
+    def _last_seen() -> float | None:
+        return runtime.coordinator.data.last_seen if runtime.coordinator.data else None
+
+    if can_queue and manager is not None and manager.has_pending_content:
+        # Content first, then sleep, in the same wake: hand the command to the
+        # drain, and start one now if the device is awake.
+        receipt = manager.submit_deep_sleep(request)
+        if not profile.probably_asleep(_last_seen()):
+            manager.notify_device_seen("deep_sleep")
+        return _sleep_response("queued", expires_at=receipt.expires_at)
+
+    # Same freshness gate as an image send: a probably-asleep device gets one
+    # short connect attempt (the probe) before the command is queued.
+    probing = profile.is_sleepy and profile.probably_asleep(_last_seen())
+    if probing:
+        if not can_queue:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="device_sleeping",
+                translation_placeholders={"device_id": device_id},
+            )
+        if not profile.probe_before_queue:
+            assert manager is not None
+            receipt = manager.submit_deep_sleep(request)
+            return _sleep_response("queued", expires_at=receipt.expires_at)
+    connect_kwargs: dict[str, Any] = (
+        {"connect_timeout": PROBE_CONNECT_TIMEOUT_S, "max_attempts": PROBE_MAX_ATTEMPTS}
+        if probing
+        else {}
+    )
+    sent: list[int] = []
+
+    async def _sleep(device: OpenDisplayDevice) -> None:
+        if sent:
+            # Already delivered over a transport that then failed; the device
+            # is asleep, never send it twice.
+            return
+        seconds = request.resolve_seconds(address)
+        await async_send_deep_sleep(device, seconds, device_id=device_id)
+        sent.append(seconds)
+
+    try:
+        await _async_connect_and_run(
+            hass, entry, _sleep, reraise_ble=can_queue, **connect_kwargs
+        )
+    except _DeviceUnavailable:
+        if not sent:
+            assert manager is not None
+            receipt = manager.submit_deep_sleep(request)
+            if probing and not profile.probably_asleep(_last_seen()):
+                # A wake advert arrived during the failed probe while nothing
+                # was queued yet; drain now instead of a full cycle later.
+                manager.notify_device_seen("post-probe")
+            return _sleep_response("queued", expires_at=receipt.expires_at)
+    except HomeAssistantError:
+        # A link that dropped after the command was written is the expected
+        # outcome, however the transport reported it.
+        if not sent:
+            raise
+
+    seconds = sent[0]
+    if manager is not None:
+        next_wake = manager.note_deep_sleep_sent(seconds)
+    else:  # pragma: no cover - the manager is always built at setup
+        next_wake = runtime.coordinator.async_note_sleep_override(seconds)
+    return _sleep_response("sent", sleep_seconds=seconds, next_wake=next_wake)
+
+
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register OpenDisplay services."""
@@ -1281,4 +1422,11 @@ def async_setup_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, "play_melody", _async_play_melody, schema=SCHEMA_PLAY_MELODY
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "deep_sleep",
+        _async_deep_sleep,
+        schema=SCHEMA_DEEP_SLEEP,
+        supports_response=SupportsResponse.OPTIONAL,
     )

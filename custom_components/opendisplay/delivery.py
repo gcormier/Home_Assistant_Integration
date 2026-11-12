@@ -9,9 +9,11 @@ again.
 Design (see docs/DEEP_SLEEP_IMPLEMENTATION_PLAN_2026-07-06.md, D4):
 
 * Latest-wins per work type — only the newest image survives, matching the
-  existing live-upload semantics.
+  existing live-upload semantics. The same holds for a queued deep-sleep
+  override (``opendisplay.deep_sleep``).
 * One connection per wake — the device stays awake while connected, so all
-  pending work drains over a single session in priority order (upload first).
+  pending work drains over a single session in priority order (upload first,
+  then config resync, and a deep-sleep override last because it ends the link).
 * Transport-agnostic trigger — `notify_device_seen(source)` is the entry point;
   today the BLE coordinator calls it, a future WiFi presence tracker could too.
 * Memory-only in v1 — a HA restart drops a pending upload (documented).
@@ -21,10 +23,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.components.bluetooth import async_set_fallback_availability_interval
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
@@ -42,6 +46,7 @@ from opendisplay import (
     PartialState,
     RefreshMode,
 )
+from opendisplay.exceptions import AuthenticationError, IntegrityCheckError
 
 from .ble_lock import ble_connection
 from .const import (
@@ -55,6 +60,7 @@ from .const import (
     SIGNAL_IMAGE_UPDATED,
     SIGNAL_PENDING_STATE,
 )
+from .deep_sleep import DeepSleepRejectedError, PendingSleep, async_send_deep_sleep
 from .transport import async_run_with_fallback
 
 if TYPE_CHECKING:
@@ -135,6 +141,10 @@ class DeliveryManager:
 
         self._pending_upload: PendingUpload | None = None
         self._pending_config_resync: bool = False
+        self._pending_sleep: PendingSleep | None = None
+        # True from a sent deep-sleep override until the device is seen again;
+        # the widened availability window is restored at that point.
+        self._sleep_override_active: bool = False
         self._last_error: str | None = None
         # Terminal state for authentication failures. The device rejects every
         # further attempt identically, and delivery is advertisement-driven with
@@ -164,6 +174,9 @@ class DeliveryManager:
         if self._pending_upload is not None and self._pending_upload.cancel_deadline:
             self._pending_upload.cancel_deadline()
             self._pending_upload.cancel_deadline = None
+        if self._pending_sleep is not None and self._pending_sleep.cancel_deadline:
+            self._pending_sleep.cancel_deadline()
+            self._pending_sleep.cancel_deadline = None
         if self._delivery_task is not None and not self._delivery_task.done():
             self._delivery_task.cancel()
             try:
@@ -189,6 +202,16 @@ class DeliveryManager:
             last_error=self._last_error,
             auth_paused=self._auth_paused,
         )
+
+    @property
+    def pending_sleep(self) -> PendingSleep | None:
+        """Return the queued deep-sleep override, if any."""
+        return self._pending_sleep
+
+    @property
+    def has_pending_content(self) -> bool:
+        """Return True if work that must precede a deep sleep is queued."""
+        return self._pending_upload is not None or self._pending_config_resync
 
     # -- submission ---------------------------------------------------------
 
@@ -238,6 +261,59 @@ class DeliveryManager:
         return DeliveryReceipt(status="queued", expires_at=expires_at)
 
     @callback
+    def submit_deep_sleep(self, request: PendingSleep) -> DeliveryReceipt:
+        """Queue a deep-sleep override for the next wake (latest-wins).
+
+        It drains after any queued content in the same wake, and expires after
+        ``queue_timeout_hours`` like a queued image. The seconds are worked out
+        when it is sent, not here.
+        """
+        if self._pending_sleep is not None and self._pending_sleep.cancel_deadline:
+            self._pending_sleep.cancel_deadline()
+        request.expires_at = request.queued_at + self._profile.queue_timeout_s
+
+        @callback
+        def _expired(_now: Any) -> None:
+            if self._pending_sleep is request:
+                self._pending_sleep = None
+                _LOGGER.warning(
+                    "%s: queued deep sleep expired after %s h without a wake",
+                    self._address,
+                    self._profile.queue_timeout_hours,
+                )
+
+        request.cancel_deadline = async_call_later(
+            self._hass, self._profile.queue_timeout_s, _expired
+        )
+        self._pending_sleep = request
+        _LOGGER.debug("%s: deep sleep queued for the next wake", self._address)
+        return DeliveryReceipt(status="queued", expires_at=request.expires_at)
+
+    @callback
+    def note_deep_sleep_sent(self, seconds: int) -> float:
+        """Record a delivered deep-sleep override; return the expected wake.
+
+        Widens the availability window for this one sleep so a long override
+        does not mark the device unavailable, and tells the coordinator so the
+        Next wake sensor and the Sleep event reflect the override. The window
+        goes back to the configured one when the device is next seen.
+        """
+        async_set_fallback_availability_interval(
+            self._hass,
+            self._address,
+            seconds + self._profile.availability_interval,
+        )
+        self._sleep_override_active = True
+        next_wake = self._coordinator.async_note_sleep_override(seconds)
+        _LOGGER.info(
+            "%s: deep sleep override sent (%s s); next wake expected at %s",
+            self._address,
+            seconds,
+            datetime.fromtimestamp(next_wake, tz=UTC).isoformat(),
+        )
+        return next_wake
+
+    @callback
     def request_config_resync(self) -> None:
         """Request a firmware/config re-read at the next wake.
 
@@ -253,6 +329,13 @@ class DeliveryManager:
     @callback
     def _on_device_seen(self) -> None:
         """Coordinator callback: the device advertised (it is awake now)."""
+        if self._sleep_override_active and not self._coordinator.sleep_override_active:
+            # The override's one sleep is over: back to the configured window.
+            self._sleep_override_active = False
+            if self._profile.is_sleepy:
+                async_set_fallback_availability_interval(
+                    self._hass, self._address, self._profile.availability_interval
+                )
         self.notify_device_seen("ble")
 
     @callback
@@ -270,7 +353,11 @@ class DeliveryManager:
         """Return True if there is deliverable work queued."""
         if self._auth_paused:
             return False
-        return self._pending_upload is not None or self._pending_config_resync
+        return (
+            self._pending_upload is not None
+            or self._pending_config_resync
+            or self._pending_sleep is not None
+        )
 
     # -- delivery drain -----------------------------------------------------
 
@@ -355,6 +442,9 @@ class DeliveryManager:
                 await self._drain_upload(device, pending)
             if self._pending_config_resync:
                 await self._drain_resync(device)
+            # Last: the link drops once the device goes to sleep.
+            if self._pending_sleep is not None:
+                await self._drain_sleep(device)
 
         # Prefer WiFi when the entry has a fresh mDNS host; fall back to BLE on any
         # WiFi failure. All inside the per-MAC lock (MAC-keyed, transport-neutral).
@@ -413,6 +503,39 @@ class DeliveryManager:
         self._pending_config_resync = False
         _write_cache(self._hass, self._entry, device_config, fw, is_flex, landing_url)
         _LOGGER.debug("%s: config resync complete", self._address)
+
+    async def _drain_sleep(self, device: OpenDisplayDevice) -> None:
+        """Send the queued deep-sleep override (after any queued content)."""
+        request = self._pending_sleep
+        if request is None:
+            return
+        seconds = request.resolve_seconds(self._address)
+        # Clear the slot before sending: once the frame is written the device
+        # is asleep, and a transport fallback must not send it a second time.
+        self._pending_sleep = None
+        try:
+            await async_send_deep_sleep(
+                device, seconds, device_id=request.device_id or self._device_id()
+            )
+        except DeepSleepRejectedError as err:
+            # A refusal is permanent (config or power source); retrying on
+            # every wake would never succeed, so drop it and say why.
+            self._cancel_sleep_deadline(request)
+            _LOGGER.error("%s: queued deep sleep refused: %s", self._address, err)
+            return
+        except AuthenticationError, IntegrityCheckError:
+            # Rejected before it ran: keep it for the next wake.
+            self._pending_sleep = request
+            raise
+        self._cancel_sleep_deadline(request)
+        self.note_deep_sleep_sent(seconds)
+
+    @staticmethod
+    def _cancel_sleep_deadline(request: PendingSleep) -> None:
+        """Cancel a deep-sleep request's expiry timer."""
+        if request.cancel_deadline:
+            request.cancel_deadline()
+            request.cancel_deadline = None
 
     # -- expiry -------------------------------------------------------------
 
