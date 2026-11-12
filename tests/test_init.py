@@ -307,6 +307,34 @@ async def test_cache_is_not_used_for_a_non_sleepy_device(
     assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
 
 
+@pytest.mark.parametrize(
+    "config_entry_data", [{CONF_CACHED_STATE: make_cached_state()}]
+)
+async def test_unchanged_device_state_does_not_rewrite_the_cache(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Setting up an unchanged device leaves the config-entry store alone.
+
+    ``config_to_json`` timestamps every export (``exported_at``), which must
+    not count as a change, or the entry is rewritten on every setup.
+    """
+    mock_config_entry.add_to_hass(hass)
+
+    with patch.object(
+        hass.config_entries,
+        "async_update_entry",
+        wraps=hass.config_entries.async_update_entry,
+    ) as update_entry:
+        assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    # HA's bluetooth discovery-key bookkeeping also updates the entry; only
+    # data writes are the cache.
+    assert not [c for c in update_entry.call_args_list if "data" in c.kwargs]
+
+
 async def test_setup_deadline_is_treated_as_a_connect_failure(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,

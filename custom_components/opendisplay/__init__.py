@@ -129,6 +129,17 @@ def _load_cache(entry: OpenDisplayConfigEntry) -> _CachedState | None:
         return None
 
 
+def _comparable(key: str, value: Any) -> Any:
+    """Return a cached field with its volatile parts removed, for comparison.
+
+    ``config_to_json`` stamps every export with ``exported_at``, so comparing
+    the raw JSON would always see a change and rewrite the entry each time.
+    """
+    if key == "config" and isinstance(value, dict):
+        return {k: v for k, v in value.items() if k != "exported_at"}
+    return value
+
+
 def _write_cache(
     hass: HomeAssistant,
     entry: OpenDisplayConfigEntry,
@@ -151,7 +162,8 @@ def _write_cache(
     }
     existing = entry.data.get(CONF_CACHED_STATE)
     if existing is not None and all(
-        existing.get(key) == value for key, value in payload.items()
+        _comparable(key, existing.get(key)) == _comparable(key, value)
+        for key, value in payload.items()
     ):
         return
     hass.config_entries.async_update_entry(
