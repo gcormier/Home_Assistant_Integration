@@ -45,6 +45,7 @@ and these actions:
 | `opendisplay.activate_buzzer` | play a tone |
 | `opendisplay.play_melody` | play a sequence of notes |
 | `opendisplay.write_nfc` | write a URL, text, MIME record or Home Assistant tag to the NFC chip |
+| `opendisplay.refresh_config` | re-read the device's configuration after changing it outside Home Assistant (a sleeping tag is read at its next wake) |
 
 **Battery-powered tags are handled properly.** A deep-sleeping tag is dark most
 of the time, so content sent to one is queued and delivered the next time it

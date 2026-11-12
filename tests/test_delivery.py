@@ -450,14 +450,21 @@ async def test_auth_paused_reaches_the_entities(
 async def test_drain_config_resync_updates_runtime_and_cache(
     entry: MockConfigEntry, manager: DeliveryManager
 ) -> None:
-    """A resync re-reads firmware and config, and refreshes the dark-start cache."""
+    """A resync re-reads firmware and config, and refreshes the dark-start cache.
+
+    The config comes from ``interrogate()`` (READ_CONFIG), never from
+    ``device.config``: the device is built with the cached config, so that
+    attribute only echoes the cache back.
+    """
+    fresh = make_sleepy_device_config()
     device = _uploading_device()
     device.read_firmware_version = AsyncMock(
         return_value={"major": 1, "minor": 2, "sha": "abc"}
     )
-    device.is_flex = False
+    device.is_flex = True
     device.landing_url = MagicMock(return_value="http://landing")
-    device.config = MagicMock()
+    device.config = MagicMock()  # the stale cache: must not be used
+    device.interrogate = AsyncMock(return_value=fresh)
 
     with (
         connects_to(device),
@@ -469,7 +476,10 @@ async def test_drain_config_resync_updates_runtime_and_cache(
     assert entry.runtime_data.config_resync_pending is False
     assert manager._pending_config_resync is False
     assert entry.runtime_data.firmware == {"major": 1, "minor": 2, "sha": "abc"}
+    device.interrogate.assert_awaited_once()
+    assert entry.runtime_data.device_config is fresh
     cache.assert_called_once()
+    assert cache.call_args.args[2] is fresh
 
 
 async def test_shutdown_detaches_from_wakes_and_cancels_the_expiry(

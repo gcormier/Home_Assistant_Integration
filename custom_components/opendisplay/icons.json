@@ -30,6 +30,9 @@
     "activate_led": {
       "service": "mdi:led-on"
     },
+    "refresh_config": {
+      "service": "mdi:refresh"
+    },
     "activate_buzzer": {
       "service": "mdi:bell-ring"
     },

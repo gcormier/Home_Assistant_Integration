@@ -429,6 +429,16 @@
         }
       }
     },
+    "refresh_config": {
+      "name": "Refresh device config",
+      "description": "Re-reads the configuration stored on an OpenDisplay device, for example after it was changed outside Home Assistant. A sleeping device is read at its next wake.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The OpenDisplay device."
+        }
+      }
+    },
     "activate_buzzer": {
       "name": "Activate buzzer",
       "description": "Triggers a buzzer tone on an OpenDisplay device. For multi-note melodies, see Play buzzer melody.",

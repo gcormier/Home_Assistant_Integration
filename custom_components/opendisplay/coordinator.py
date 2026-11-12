@@ -128,6 +128,9 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         )
         self._cancel_asleep: CALLBACK_TYPE | None = None
         self._pending_asleep: AsleepEvent | None = None
+        # When the device is expected to (have) go(ne) to sleep for the pending
+        # asleep event; lets a sleep-duration change re-derive its next wake.
+        self._pending_sleep_at: float | None = None
         # Subscribers notified once when the advertised reboot flag goes
         # False -> True (the device rebooted since we last talked to it).
         self._reboot_callbacks: set[CALLBACK_TYPE] = set()
@@ -264,6 +267,7 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
             self._cancel_asleep()
             self._cancel_asleep = None
         self._pending_asleep = None
+        self._pending_sleep_at = None
         tracking = self.wake_tracking
         if tracking is None:
             return None
@@ -284,6 +288,7 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
         self._pending_asleep = AsleepEvent(
             next_wake=next_wake, sleep_seconds=sleep_seconds
         )
+        self._pending_sleep_at = sleep_at
         self._cancel_asleep = async_call_later(self.hass, delay, self._async_asleep)
         return next_wake
 
@@ -314,6 +319,45 @@ class OpenDisplayCoordinator(PassiveBluetoothDataUpdateCoordinator):
             asleep_event=event,
         )
         self.async_update_listeners()
+
+    @callback
+    def async_set_wake_tracking(self, tracking: WakeTracking) -> None:
+        """Apply re-read wake tracking (e.g. a new deep_sleep_time_seconds).
+
+        Only valid while wake tracking stays enabled: turning it on or off
+        changes which entities exist, which needs an entry reload. A level-1
+        prediction already made from the old sleep duration is re-derived so the
+        next-wake sensor does not wait for another advertisement to correct.
+        """
+        assert self.wake_tracking is not None
+        if tracking == self.wake_tracking:
+            return
+        if tracking.byte_index != self.wake_tracking.byte_index:
+            self._wake_tracker = WakeTracker(tracking.byte_index)
+        self.wake_tracking = tracking
+        pending = self._pending_asleep
+        sleep_at = self._pending_sleep_at
+        if (
+            tracking.byte_index is not None
+            or pending is None
+            or sleep_at is None
+            or tracking.sleep_seconds is None
+        ):
+            return
+        next_wake = sleep_at + tracking.sleep_seconds
+        self._pending_asleep = AsleepEvent(
+            next_wake=next_wake, sleep_seconds=tracking.sleep_seconds
+        )
+        if self.data is not None:
+            # Clear the per-advertisement events so listeners do not re-fire them.
+            self.data = replace(
+                self.data,
+                next_wake=next_wake,
+                button_events=[],
+                touch_events=[],
+                wake_event=None,
+            )
+            self.async_update_listeners()
 
     @callback
     def async_shutdown_wake_timer(self) -> None:

@@ -212,6 +212,16 @@ activate_led:
           unit_of_measurement: ms
           mode: slider
 
+refresh_config:
+  name: Refresh device config
+  description: Re-reads an OpenDisplay device's configuration. A sleeping device is read at its next wake.
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: opendisplay
+
 activate_buzzer:
   name: Activate buzzer
   description: Plays a tone on an OpenDisplay device's buzzer.

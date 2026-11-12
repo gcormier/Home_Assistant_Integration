@@ -128,6 +128,17 @@ def _load_cache(entry: OpenDisplayConfigEntry) -> _CachedState | None:
         return None
 
 
+def _comparable(key: str, value: Any) -> Any:
+    """Return a cached field with its volatile parts removed, for comparison.
+
+    ``config_to_json`` stamps every export with ``exported_at``, so comparing
+    the raw JSON would always see a change and rewrite the entry each time.
+    """
+    if key == "config" and isinstance(value, dict):
+        return {k: v for k, v in value.items() if k != "exported_at"}
+    return value
+
+
 def _write_cache(
     hass: HomeAssistant,
     entry: OpenDisplayConfigEntry,
@@ -150,7 +161,8 @@ def _write_cache(
     }
     existing = entry.data.get(CONF_CACHED_STATE)
     if existing is not None and all(
-        existing.get(key) == value for key, value in payload.items()
+        _comparable(key, existing.get(key)) == _comparable(key, value)
+        for key, value in payload.items()
     ):
         return
     hass.config_entries.async_update_entry(
@@ -170,6 +182,154 @@ def _cache_setup_if_sleepy(
     if not profile.is_sleepy:
         return None
     return cached
+
+
+def _wake_tracking_for(device_config: GlobalConfig) -> WakeTracking | None:
+    """Return how wakes are tracked for this config, or None if they are not.
+
+    Level 2 when the firmware publishes wake info; otherwise level 1 (reboot
+    flag) for deep-sleeping devices only.
+    """
+    power = device_config.power
+    wake_index = power.published_wake_info_byte_index
+    if wake_index is None and not power.deep_sleep_enabled:
+        return None
+    return WakeTracking(
+        byte_index=wake_index,
+        sleep_seconds=power.deep_sleep_time_seconds
+        if power.deep_sleep_enabled
+        else None,
+    )
+
+
+def _device_info(
+    device_config: GlobalConfig,
+    firmware: FirmwareVersion,
+    is_flex: bool,
+    landing_url: str | None,
+) -> dict[str, Any]:
+    """Return the device registry fields derived from the device's own state."""
+    # Imported here rather than at module scope because update.py imports from
+    # this module — a top-level import would be circular. Sharing the formatter
+    # keeps the device registry and the update entity from disagreeing about the
+    # version, which is what makes an update appear permanently pending.
+    from .update import _format_firmware_version
+
+    manufacturer = device_config.manufacturer
+    display = device_config.displays[0]
+    color_scheme_enum = display.color_scheme_enum
+    color_scheme = (
+        str(color_scheme_enum)
+        if isinstance(color_scheme_enum, int)
+        else color_scheme_enum.name
+    )
+    size = (
+        f'{display.screen_diagonal_inches:.1f}"'
+        if display.screen_diagonal_inches is not None
+        else f"{display.pixel_width}x{display.pixel_height}"
+    )
+    return {
+        "manufacturer": manufacturer.manufacturer_name,
+        "model": f"{size} {color_scheme}",
+        "sw_version": _format_firmware_version(
+            firmware["major"], firmware["minor"], firmware.get("patch")
+        ),
+        "hw_version": f"{manufacturer.board_type_name or manufacturer.board_type}"
+        if is_flex
+        else None,
+        "configuration_url": landing_url,
+    }
+
+
+def _entity_layout(
+    entry: OpenDisplayConfigEntry, device_config: GlobalConfig, is_flex: bool
+) -> tuple[Any, ...]:
+    """Return everything that decides which entities and platforms exist.
+
+    The platforms read these once at setup, so a change here cannot be applied
+    in place and needs an entry reload. Everything else (sleep timing, the
+    config handed to uploads, device registry fields) is updated live.
+    """
+    return (
+        is_flex,
+        SleepProfile.from_entry(entry, device_config).is_sleepy,
+        _wake_tracking_for(device_config) is not None,
+        device_config.power.power_mode,
+        device_config.binary_inputs,
+        device_config.touch_controllers,
+        device_config.sensors,
+        device_config.wifi_config is not None,
+    )
+
+
+@callback
+def async_apply_device_config(
+    hass: HomeAssistant,
+    entry: OpenDisplayConfigEntry,
+    *,
+    device_config: GlobalConfig,
+    firmware: FirmwareVersion,
+    is_flex: bool,
+    landing_url: str | None,
+) -> None:
+    """Apply a freshly read device config to a running entry.
+
+    Called by the wake-time resync with what the device just returned. Updates
+    the cache, the runtime config, the sleep profile, HA's availability horizon,
+    the coordinator's wake tracking (next-wake estimate) and the device registry
+    in place, so the new sleep timing takes effect without a reload. A reload is
+    scheduled only when the set of entities would change; it waits for the BLE
+    link to be released, since reconnecting during the wake races the very
+    link the resync is using.
+    """
+    runtime = entry.runtime_data
+    address = entry.unique_id
+    assert address is not None
+
+    needs_reload = _entity_layout(
+        entry, runtime.device_config, runtime.is_flex
+    ) != _entity_layout(entry, device_config, is_flex)
+
+    runtime.firmware = firmware
+    runtime.device_config = device_config
+    runtime.is_flex = is_flex
+    _write_cache(hass, entry, device_config, firmware, is_flex, landing_url)
+
+    if (
+        device := dr.async_get(hass).async_get_device(
+            connections={(CONNECTION_BLUETOOTH, address)}
+        )
+    ) is not None:
+        dr.async_get(hass).async_update_device(
+            device.id, **_device_info(device_config, firmware, is_flex, landing_url)
+        )
+
+    if needs_reload:
+        _LOGGER.info(
+            "%s: device config changed which entities exist; reloading once the "
+            "link is released",
+            address,
+        )
+        hass.async_create_task(_async_reload_after_reboot(hass, entry))
+        return
+
+    profile = SleepProfile.from_entry(entry, device_config)
+    if profile != runtime.sleep_profile:
+        _LOGGER.debug(
+            "%s: sleep profile changed: %s -> %s",
+            address,
+            runtime.sleep_profile,
+            profile,
+        )
+        runtime.sleep_profile = profile
+        if profile.is_sleepy:
+            async_set_fallback_availability_interval(
+                hass, address, profile.availability_interval
+            )
+
+    tracking = _wake_tracking_for(device_config)
+    if tracking is not None:
+        runtime.coordinator.async_set_wake_tracking(tracking)
 
 
 def _get_encryption_key(entry: OpenDisplayConfigEntry) -> bytes | None:
@@ -293,55 +453,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
             landing_url = cached.landing_url
             from_cache = True
 
-    # Imported here rather than at module scope because update.py imports from
-    # this module — a top-level import would be circular. Sharing the formatter
-    # keeps the device registry and the update entity from disagreeing about the
-    # version, which is what makes an update appear permanently pending.
-    from .update import _format_firmware_version
-
     profile = SleepProfile.from_entry(entry, device_config)
-    power = device_config.power
-    wake_index = power.published_wake_info_byte_index
     coordinator = OpenDisplayCoordinator(
         hass,
         address,
         device_config.binary_inputs,
-        # Level 2 when the firmware publishes wake info; otherwise level 1
-        # (reboot flag) for deep-sleeping devices only.
-        WakeTracking(
-            byte_index=wake_index,
-            sleep_seconds=power.deep_sleep_time_seconds
-            if power.deep_sleep_enabled
-            else None,
-        )
-        if wake_index is not None or power.deep_sleep_enabled
-        else None,
+        _wake_tracking_for(device_config),
     )
     entry.async_on_unload(coordinator.async_shutdown_wake_timer)
 
-    manufacturer = device_config.manufacturer
-    display = device_config.displays[0]
-    color_scheme_enum = display.color_scheme_enum
-    color_scheme = (
-        str(color_scheme_enum)
-        if isinstance(color_scheme_enum, int)
-        else color_scheme_enum.name
-    )
-    size = (
-        f'{display.screen_diagonal_inches:.1f}"'
-        if display.screen_diagonal_inches is not None
-        else f"{display.pixel_width}x{display.pixel_height}"
-    )
     dr.async_get(hass).async_get_or_create(
         config_entry_id=entry.entry_id,
         connections={(CONNECTION_BLUETOOTH, address)},
-        manufacturer=manufacturer.manufacturer_name,
-        model=f"{size} {color_scheme}",
-        sw_version=_format_firmware_version(fw["major"], fw["minor"], fw.get("patch")),
-        hw_version=f"{manufacturer.board_type_name or manufacturer.board_type}"
-        if is_flex
-        else None,
-        configuration_url=landing_url,
+        **_device_info(device_config, fw, is_flex, landing_url),
     )
 
     entry.runtime_data = OpenDisplayRuntimeData(
@@ -389,7 +513,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenDisplayConfigEntry) 
         window; route to an opportunistic config resync instead. Non-sleepy
         devices keep the reload behavior.
         """
-        if profile.is_sleepy:
+        if entry.runtime_data.sleep_profile.is_sleepy:
             manager.request_config_resync()
         else:
             hass.async_create_task(_async_reload_after_reboot(hass, entry))

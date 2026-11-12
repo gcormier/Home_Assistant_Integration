@@ -247,6 +247,8 @@ def _led_step_fields(
     }
 
 
+SCHEMA_REFRESH_CONFIG = vol.Schema({vol.Required(ATTR_DEVICE_ID): cv.string})
+
 SCHEMA_ACTIVATE_LED = vol.Schema(
     {
         vol.Required(ATTR_DEVICE_ID): cv.string,
@@ -519,11 +521,31 @@ async def _async_connect_and_run(
             translation_domain=DOMAIN, translation_key="authentication_error"
         ) from err
 
+    # The cached config lets the connection skip READ_CONFIG, so the device
+    # object's own ``config`` is that cache, not what the device holds. A
+    # pending resync (set after a dark start or a reboot) is piggybacked on this
+    # link via ``_run_then_resync`` rather than waiting for the next wake.
     base_kwargs: dict[str, Any] = {
         "config": entry.runtime_data.device_config,
         "use_measured_palettes": use_measured_palettes,
         "encryption_key": encryption_key,
     }
+
+    async def _run_then_resync(device: OpenDisplayDevice) -> None:
+        await action(device)
+        manager = entry.runtime_data.delivery
+        if manager is None or not entry.runtime_data.config_resync_pending:
+            return
+        try:
+            await manager.async_resync_over(device)
+        except (OpenDisplayError, OSError) as err:
+            # The requested action already succeeded; a failed re-read must not
+            # fail it (or, over WiFi, make the fallback re-run it over BLE). The
+            # resync stays pending for the next wake.
+            _LOGGER.debug(
+                "%s: config resync after service call failed: %s", address, err
+            )
+
     if connect_timeout is not None:
         base_kwargs["timeout"] = connect_timeout
     if max_attempts is not None:
@@ -558,7 +580,7 @@ async def _async_connect_and_run(
             await async_run_with_fallback(
                 hass,
                 entry,
-                action,
+                _run_then_resync,
                 base_kwargs=base_kwargs,
                 ble_unavailable=_ble_unavailable,
             )
@@ -1254,6 +1276,34 @@ async def _async_play_melody(call: ServiceCall) -> None:
 
 
 @callback
+async def _async_refresh_config(call: ServiceCall) -> None:
+    """Re-read the device's config, now if it is awake, else at its next wake.
+
+    For when the config was changed outside Home Assistant. A sleeping tag is
+    not woken (it cannot be); the re-read is queued and runs over the next
+    wake's connection. An awake tag is read straight away over a short-lived
+    link; if that connect fails, the request stays queued for the next wake.
+    """
+    entry = _get_entry_for_device(call)
+    runtime = entry.runtime_data
+    manager = runtime.delivery
+    assert manager is not None
+    manager.request_config_refresh()
+
+    profile = runtime.sleep_profile
+    last_seen = runtime.coordinator.data.last_seen if runtime.coordinator.data else None
+    if profile.is_sleepy and profile.probably_asleep(last_seen):
+        return
+
+    async def _noop(_device: OpenDisplayDevice) -> None:
+        """Nothing to do: the resync piggybacks on the open link."""
+
+    with contextlib.suppress(_DeviceUnavailable):
+        await _async_connect_and_run(
+            call.hass, entry, _noop, reraise_ble=profile.is_sleepy
+        )
+
+
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register OpenDisplay services."""
     hass.services.async_register(
@@ -1272,6 +1322,12 @@ def async_setup_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, "activate_led", _async_activate_led, schema=SCHEMA_ACTIVATE_LED
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "refresh_config",
+        _async_refresh_config,
+        schema=SCHEMA_REFRESH_CONFIG,
     )
     hass.services.async_register(
         DOMAIN, "activate_buzzer", _async_activate_buzzer, schema=SCHEMA_ACTIVATE_BUZZER
