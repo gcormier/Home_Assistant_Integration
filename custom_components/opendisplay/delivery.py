@@ -59,6 +59,7 @@ from .transport import async_run_with_fallback
 
 if TYPE_CHECKING:
     from . import OpenDisplayConfigEntry
+    from .sleep import SleepProfile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,6 +76,13 @@ DELIVERY_DEADLINE_S = 600.0
 # retry on every wake until ``queue_timeout`` hours later; instead it is dropped
 # with a ``content_expired`` event so the failure surfaces promptly.
 MAX_DELIVERY_ATTEMPTS = 5
+
+# After a failed config resync, hold off retrying it for this long. Delivery is
+# advertisement-driven, so without a hold-off a resync that fails (device asleep
+# again mid-read, a truncated config read) would reconnect on every remaining
+# advertisement of the same wake. Longer than any wake window, so the retry
+# lands on a later wake; a queued upload is not held back by it.
+RESYNC_RETRY_BACKOFF_S = 60.0
 
 # Sentinel distinguishing "no key" (None) from "malformed key" during resolve.
 _KEY_INVALID = object()
@@ -130,11 +138,13 @@ class DeliveryManager:
         self._entry = entry
         runtime = entry.runtime_data
         self._coordinator = runtime.coordinator
-        self._profile = runtime.sleep_profile
         self._address: str = entry.unique_id or ""
 
         self._pending_upload: PendingUpload | None = None
         self._pending_config_resync: bool = False
+        # Monotonic time before which a pending resync is not retried (set after
+        # a failed attempt; see RESYNC_RETRY_BACKOFF_S).
+        self._resync_retry_at: float = 0.0
         self._last_error: str | None = None
         # Terminal state for authentication failures. The device rejects every
         # further attempt identically, and delivery is advertisement-driven with
@@ -146,6 +156,15 @@ class DeliveryManager:
         self._delivering: bool = False
         self._delivery_task: asyncio.Task[None] | None = None
         self._unsub_device_seen: CALLBACK_TYPE | None = None
+
+    @property
+    def _profile(self) -> SleepProfile:
+        """Return the entry's current sleep profile.
+
+        Read live rather than captured at construction: a wake-time resync can
+        replace it in place when the device's power config changed.
+        """
+        return self._entry.runtime_data.sleep_profile
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -270,14 +289,20 @@ class DeliveryManager:
         """Return True if there is deliverable work queued."""
         if self._auth_paused:
             return False
-        return self._pending_upload is not None or self._pending_config_resync
+        return self._pending_upload is not None or self._resync_due()
+
+    def _resync_due(self) -> bool:
+        """Return True if a config resync is pending and not held off."""
+        return self._pending_config_resync and time.monotonic() >= self._resync_retry_at
 
     # -- delivery drain -----------------------------------------------------
 
     async def _deliver(self) -> None:
         """Open one connection and drain all pending slots in priority order."""
+        completed = False
         try:
             await self._drain_once()
+            completed = True
         except asyncio.CancelledError:
             raise
         except TimeoutError as err:
@@ -317,6 +342,10 @@ class DeliveryManager:
             _LOGGER.warning("%s: delivery failed: %s", self._address, err)
             self._register_attempt_failure(str(err))
         finally:
+            # A resync still pending after a failed drain is held off until a
+            # later wake rather than retried on this wake's next advertisement.
+            if not completed and self._pending_config_resync:
+                self._resync_retry_at = time.monotonic() + RESYNC_RETRY_BACKOFF_S
             self._delivering = False
             self._delivery_task = None
 
@@ -353,8 +382,8 @@ class DeliveryManager:
             pending = self._pending_upload
             if pending is not None:
                 await self._drain_upload(device, pending)
-            if self._pending_config_resync:
-                await self._drain_resync(device)
+            if self._resync_due():
+                await self.async_resync_over(device)
 
         # Prefer WiFi when the entry has a fresh mDNS host; fall back to BLE on any
         # WiFi failure. All inside the per-MAC lock (MAC-keyed, transport-neutral).
@@ -394,24 +423,31 @@ class DeliveryManager:
         self._notify_state()
         _LOGGER.info("%s: queued content delivered", self._address)
 
-    async def _drain_resync(self, device: OpenDisplayDevice) -> None:
-        """Re-read firmware/config over the open link and refresh the cache."""
+    async def async_resync_over(self, device: OpenDisplayDevice) -> None:
+        """Re-read firmware and config over an open link and apply them.
+
+        The device object is built with the cached config (so uploads can skip
+        interrogation), which means ``device.config`` is only that cache echoed
+        back. ``interrogate()`` sends READ_CONFIG and returns what the device
+        really holds now. A failure propagates: the caller keeps the resync
+        pending and leaves the cache alone.
+        """
         # Local import avoids an import cycle (__init__ imports this module).
-        from . import _write_cache
+        from . import async_apply_device_config
 
         fw = await device.read_firmware_version()
-        is_flex = device.is_flex
-        landing_url = device.landing_url()
-        device_config = device.config
-        if device_config is None:
-            return
-        runtime = self._entry.runtime_data
-        runtime.firmware = fw
-        runtime.device_config = device_config
-        runtime.is_flex = is_flex
-        runtime.config_resync_pending = False
+        device_config = await device.interrogate()
+        async_apply_device_config(
+            self._hass,
+            self._entry,
+            device_config=device_config,
+            firmware=fw,
+            is_flex=device.is_flex,
+            landing_url=device.landing_url(),
+        )
+        self._entry.runtime_data.config_resync_pending = False
         self._pending_config_resync = False
-        _write_cache(self._hass, self._entry, device_config, fw, is_flex, landing_url)
+        self._resync_retry_at = 0.0
         _LOGGER.debug("%s: config resync complete", self._address)
 
     # -- expiry -------------------------------------------------------------

@@ -509,11 +509,31 @@ async def _async_connect_and_run(
             translation_domain=DOMAIN, translation_key="authentication_error"
         ) from err
 
+    # The cached config lets the connection skip READ_CONFIG, so the device
+    # object's own ``config`` is that cache, not what the device holds. A
+    # pending resync (set after a dark start or a reboot) is piggybacked on this
+    # link via ``_run_then_resync`` rather than waiting for the next wake.
     base_kwargs: dict[str, Any] = {
         "config": entry.runtime_data.device_config,
         "use_measured_palettes": use_measured_palettes,
         "encryption_key": encryption_key,
     }
+
+    async def _run_then_resync(device: OpenDisplayDevice) -> None:
+        await action(device)
+        manager = entry.runtime_data.delivery
+        if manager is None or not entry.runtime_data.config_resync_pending:
+            return
+        try:
+            await manager.async_resync_over(device)
+        except (OpenDisplayError, OSError) as err:
+            # The requested action already succeeded; a failed re-read must not
+            # fail it (or, over WiFi, make the fallback re-run it over BLE). The
+            # resync stays pending for the next wake.
+            _LOGGER.debug(
+                "%s: config resync after service call failed: %s", address, err
+            )
+
     if connect_timeout is not None:
         base_kwargs["timeout"] = connect_timeout
     if max_attempts is not None:
@@ -548,7 +568,7 @@ async def _async_connect_and_run(
             await async_run_with_fallback(
                 hass,
                 entry,
-                action,
+                _run_then_resync,
                 base_kwargs=base_kwargs,
                 ble_unavailable=_ble_unavailable,
             )
